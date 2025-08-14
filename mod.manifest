@@ -1,0 +1,13 @@
+<kcd_mod>
+  <info>
+    <name>Provision Purge</name>
+    <modid>provisionpurge</modid>
+    <description>Remove rotten food</description>
+    <author>hoskope</author>
+    <version>1.1</version>
+    <created_on>2025-08-08</created_on>
+  </info>
+  <supports>
+    <kcd_version>1.*</kcd_version>
+  </supports>
+</kcd_mod>
