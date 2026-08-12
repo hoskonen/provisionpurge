@@ -1,16 +1,16 @@
 ProvisionPurge = ProvisionPurge or {}
 
--- 🛠 Default config (fallbacks)
+-- Default config (fallbacks)
 ProvisionPurge.config = {
     rottenThresholdFood = 0.50,
     rottenThresholdHerb = 0.40,
-    debugLogs           = true,
+    debugLogs           = false,
     enableSleepCleanup  = true,
     showMessages        = true,
 
-    -- NEW: avoid purge on SkipTime cancel or micro-naps
-    requireRealSleep    = true, -- gate purge on actual rest gain
-    minExhaustGain      = 3, -- how much rest must be gained to count
+    -- Avoid purge on SkipTime cancel or very short rests.
+    requireRealSleep    = true,
+    minExhaustGain      = 3,
 }
 
 -- -----------------------------
@@ -22,8 +22,12 @@ ProvisionPurge._sleepSession = { startExhaust = nil }
 -- Debounce duplicate OnHide
 ProvisionPurge._wakeGuard = { lastRunMs = 0, cooldownMs = 1200 }
 
--- Ensure SkipTime listener only registered once
-ProvisionPurge._skipListenerRegistered = false
+ProvisionPurge._skaldSkipTimeHook = {
+    registered = false,
+    node = nil,
+    startConn = nil,
+    stopConn = nil,
+}
 
 -- -----------------------------
 -- Utils
@@ -31,7 +35,7 @@ ProvisionPurge._skipListenerRegistered = false
 local function nowMillis()
     -- Best-effort monotonic-ish
     if System.GetCurrTime then
-        -- seconds → ms
+        -- seconds to ms
         local ok, t = pcall(System.GetCurrTime)
         if ok and type(t) == "number" then return math.floor(t * 1000) end
     end
@@ -96,14 +100,14 @@ local ok, err = pcall(function()
 end)
 
 if not ok then
-    Info("⚠ Failed to load ProvisionPurgeConfig.lua: " .. tostring(err))
+    Info("Failed to load ProvisionPurgeConfig.lua: " .. tostring(err))
 elseif ProvisionPurge_Config then
     for k, v in pairs(ProvisionPurge_Config) do
         ProvisionPurge.config[k] = v
     end
-    Info("Loaded config from ProvisionPurgeConfig.lua")
+    Log("Loaded config from ProvisionPurgeConfig.lua")
 else
-    Info("⚠ ProvisionPurgeConfig.lua loaded but no ProvisionPurge_Config table found")
+    Info("ProvisionPurgeConfig.lua loaded but no ProvisionPurge_Config table found")
 end
 
 -- Lookup tables
@@ -114,77 +118,198 @@ Script.ReloadScript("Scripts/ProvisionPurge/HerbLookup.lua")
 -- Lifecycle hooks
 -- -----------------------------
 function ProvisionPurge.OnGameplayStarted(actionName, eventName, argTable)
-    Info("OnGameplayStarted fired")
-    ProvisionPurge.DumpConfig()
+    Log("OnGameplayStarted fired")
+    if ProvisionPurge.config.debugLogs then
+        ProvisionPurge.DumpConfig()
+    end
     ProvisionPurge.Initialize(true)
 end
 
-function ProvisionPurge.OnSetFaderState(actionName, eventName, argTable)
-    Info("OnSetFaderState fired → ensuring watcher is running")
-    ProvisionPurge.Initialize(false)
-end
-
 -- -----------------------------
--- SkipTime / Sleep hook
+-- Sleep hook
 -- -----------------------------
-function ProvisionPurge:onSkipTimeEvent(elementName, instanceId, eventName, argTable)
-    if not ProvisionPurge.config.enableSleepCleanup then return end
-    local player = ProvisionPurge.GetPlayer()
-
-    if eventName == "OnSetFaderState" and argTable and argTable[1] == "sleep" then
-        Log("Sleep session starting...")
-        if ProvisionPurge.config.requireRealSleep then
-            ProvisionPurge._sleepSession.startExhaust = getExhaust(player)
-            Log("Captured start exhaust: " .. tostring(ProvisionPurge._sleepSession.startExhaust))
-        end
+function ProvisionPurge:HandleSleepStart()
+    if not ProvisionPurge.config.enableSleepCleanup then
         return
     end
 
-    if eventName == "OnHide" then
-        -- Debounce double close
-        if not shouldRunOnce() then
-            Log("Skip duplicate wake trigger (debounced)")
-            return
-        end
+    Log("Sleep session starting...")
 
-        local okToRun = true
-        if ProvisionPurge.config.requireRealSleep then
-            local startExh = ProvisionPurge._sleepSession.startExhaust
-            local endExh   = getExhaust(player)
+    if ProvisionPurge.config.requireRealSleep then
+        local player = ProvisionPurge.GetPlayer()
+        ProvisionPurge._sleepSession.startExhaust = getExhaust(player)
 
-            local gain     = 0
-            if type(startExh) == "number" and type(endExh) == "number" then
-                gain = endExh - startExh
-                if gain < 0 then gain = 0 end -- clamp negative blips after wake
-            else
-                -- If we never captured start, be conservative
-                okToRun = false
-            end
-
-            if okToRun then
-                okToRun = gain >= (ProvisionPurge.config.minExhaustGain or 3)
-            end
-
-            Log(string.format("Sleep gain check: start=%s end=%s Δ=%.1f → %s",
-                tostring(startExh), tostring(endExh), gain, okToRun and "ALLOW" or "BLOCK"))
-        end
-
-        -- Always reset session
-        ProvisionPurge._sleepSession.startExhaust = nil
-
-        if not okToRun then
-            Log("Sleep canceled or too short → skipping purge")
-            return
-        end
-
-        Log("Woke up from sleep → cleaning spoiled provisions")
-        -- Let inventory settle a moment after SkipTime closes
-        Script.SetTimer(500, function() ProvisionPurge.ScanInventory() end)
+        Log(
+            "Captured start exhaust: "
+                .. tostring(ProvisionPurge._sleepSession.startExhaust)
+        )
     end
 end
 
+function ProvisionPurge:HandleSleepEnd()
+    if not ProvisionPurge.config.enableSleepCleanup then
+        return
+    end
+
+    -- Debounce double close
+    if not shouldRunOnce() then
+        Log("Skip duplicate wake trigger (debounced)")
+        return
+    end
+
+    local player = ProvisionPurge.GetPlayer()
+
+    local okToRun = true
+
+    if ProvisionPurge.config.requireRealSleep then
+        local startExh = ProvisionPurge._sleepSession.startExhaust
+        local endExh = getExhaust(player)
+
+        local gain = 0
+
+        if type(startExh) == "number" and type(endExh) == "number" then
+            gain = startExh - endExh
+
+            if gain < 0 then
+                gain = 0
+            end
+        else
+            -- If we never captured start, be conservative
+            okToRun = false
+        end
+
+        if okToRun then
+            okToRun = gain >= (ProvisionPurge.config.minExhaustGain or 3)
+        end
+
+        Log(
+            string.format(
+                "Sleep gain check: start=%s end=%s delta=%.1f -> %s",
+                tostring(startExh),
+                tostring(endExh),
+                gain,
+                okToRun and "ALLOW" or "BLOCK"
+            )
+        )
+    end
+
+    -- Always reset session
+    ProvisionPurge._sleepSession.startExhaust = nil
+
+    if not okToRun then
+        Log("Sleep canceled or too short -> skipping purge")
+        return
+    end
+
+    Log("Woke up from sleep -> cleaning spoiled provisions")
+
+    -- Let inventory settle a moment after SkipTime closes
+    Script.SetTimer(500, function()
+        ProvisionPurge.ScanInventory()
+    end)
+end
+
+function ProvisionPurge.InitializeSkaldSkipTimeHook()
+    local hook = ProvisionPurge._skaldSkipTimeHook
+    if hook.registered then
+        return true
+    end
+
+    if not wh then
+        Log("LuaUtils SKALD wrappers are not available")
+        return false
+    end
+
+    local triggerClass = nil
+    local createArgs = { IsActive = true }
+    local startOutput = "OnStarted"
+    local stopOutput = "OnStopped"
+    local triggerLabel = "playermodule.SkipTimeTrigger"
+
+    if wh.entitymodule and wh.entitymodule.ActorSkipTimeTrigger then
+        local soul = nil
+        if wh.globals then
+            local okSoul, value = pcall(function() return wh.globals.soul end)
+            if okSoul then
+                soul = value
+            end
+        end
+
+        if soul then
+            triggerClass = wh.entitymodule.ActorSkipTimeTrigger
+            createArgs = { IsActive = true, Soul = soul }
+            startOutput = "SkipTimeStarted"
+            stopOutput = "SkipTimeEnded"
+            triggerLabel = "entitymodule.ActorSkipTimeTrigger"
+        else
+            Log("LuaUtils SKALD ActorSkipTimeTrigger is available, but player soul is not")
+        end
+    end
+
+    if not triggerClass and wh.playermodule and wh.playermodule.SkipTimeTrigger then
+        triggerClass = wh.playermodule.SkipTimeTrigger
+    end
+
+    if not triggerClass then
+        Log("LuaUtils SKALD SkipTime trigger is not available")
+        return false
+    end
+
+    if type(triggerClass.Create) ~= "function" then
+        Log("LuaUtils SKALD " .. triggerLabel .. ".Create is not available")
+        return false
+    end
+
+    local node, err = triggerClass.Create(createArgs)
+    if not node then
+        Log("Failed to create SKALD " .. triggerLabel .. ": " .. tostring(err))
+        return false
+    end
+
+    local startConn, startErr = node:BindOutput(startOutput, function()
+        Log("SKALD SkipTime started")
+        ProvisionPurge:HandleSleepStart()
+    end)
+
+    if not startConn then
+        Log("Failed to bind SKALD SkipTime start output: " .. tostring(startErr))
+        node:Destroy()
+        return false
+    end
+
+    local stopConn, stopErr = node:BindOutput(stopOutput, function()
+        Log("SKALD SkipTime stopped")
+        Script.SetTimer(250, function()
+            ProvisionPurge:HandleSleepEnd()
+        end)
+    end)
+
+    if not stopConn then
+        Log("Failed to bind SKALD SkipTime stop output: " .. tostring(stopErr))
+        startConn:Disconnect()
+        node:Destroy()
+        return false
+    end
+
+    local ok, activateErr = node:Activate()
+    if not ok then
+        Log("Failed to activate SKALD SkipTimeTrigger: " .. tostring(activateErr))
+        stopConn:Disconnect()
+        startConn:Disconnect()
+        node:Destroy()
+        return false
+    end
+
+    hook.registered = true
+    hook.node = node
+    hook.startConn = startConn
+    hook.stopConn = stopConn
+    Log("Registered SKALD " .. triggerLabel .. " for sleep/wake cleanup")
+    return true
+end
+
 -- -----------------------------
--- Init (register SkipTime listener once)
+-- Init
 -- -----------------------------
 function ProvisionPurge.Initialize(fullInit)
     if fullInit and ProvisionPurge._initialized then
@@ -193,15 +318,12 @@ function ProvisionPurge.Initialize(fullInit)
     end
     if fullInit then ProvisionPurge._initialized = true end
 
-    if ProvisionPurge.config.enableSleepCleanup and not ProvisionPurge._skipListenerRegistered then
-        if UIAction and UIAction.RegisterElementListener then
-            UIAction.RegisterElementListener(ProvisionPurge, "SkipTime", -1, "", "onSkipTimeEvent")
-            ProvisionPurge._skipListenerRegistered = true
-            Log("Registered SkipTime listener for sleep/wake cleanup")
-        else
-            Log("UIAction not available for SkipTime registration")
-        end
+    if not ProvisionPurge.config.enableSleepCleanup then
+        Log("Sleep cleanup disabled by config")
+        return
     end
+
+    ProvisionPurge.InitializeSkaldSkipTimeHook()
 end
 
 -- -----------------------------
@@ -277,12 +399,7 @@ function ProvisionPurge.ScanInventory()
             end)
         end
     else
-        Info("No spoiled provisions found.")
+        Log("No spoiled provisions found.")
     end
 end
 
--- -----------------------------
--- System listeners (kept from your original)
--- -----------------------------
-UIAction.RegisterEventSystemListener(ProvisionPurge, "System", "OnGameplayStarted", "OnGameplayStarted")
-UIAction.RegisterEventSystemListener(ProvisionPurge, "System", "OnSetFaderState", "OnSetFaderState")
