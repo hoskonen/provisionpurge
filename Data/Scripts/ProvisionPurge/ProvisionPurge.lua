@@ -2,8 +2,8 @@ ProvisionPurge = ProvisionPurge or {}
 
 -- Default config (fallbacks)
 ProvisionPurge.config = {
-    rottenThresholdFood = 0.50,
-    rottenThresholdHerb = 0.40,
+    rottenThresholdFood = 0.40,
+    rottenThresholdHerb = 0.30,
     debugLogs           = false,
     enableSleepCleanup  = true,
     showMessages        = true,
@@ -313,7 +313,7 @@ end
 -- -----------------------------
 function ProvisionPurge.Initialize(fullInit)
     if fullInit and ProvisionPurge._initialized then
-        Info("Already initialized, skipping")
+        Log("Already initialized, skipping")
         return
     end
     if fullInit then ProvisionPurge._initialized = true end

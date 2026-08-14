@@ -6,4 +6,4 @@ Script.ReloadScript("Scripts/ProvisionPurge/ProvisionPurge.lua")
 
 -- Register lifecycle event
 UIAction.RegisterEventSystemListener(ProvisionPurge, "System", "OnGameplayStarted", "OnGameplayStarted")
-System.LogAlways("[Rotten To The Core]: Event listener registered")
+System.LogAlways("[ProvisionPurge]: Event listener registered")
